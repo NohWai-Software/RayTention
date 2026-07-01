@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026  NohWai Software
 # License: AGPL-3.0 — see LICENSE file
+# ==============================================================================
+# PATENT PENDING NOTICE
+# This file contains the implementation of the RayTention attention mechanism.
+# The methods, algorithms, and architectures herein are protected under 
+# U.S. Patent Application No. 64/102,801. 
+# Copyright (c) 2026 NohWai Software. All Rights Reserved.
+# ==============================================================================
 """
 Definitive Benchmark: Standard, GQA, MLA vs RayTention
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
