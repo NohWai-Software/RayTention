@@ -1,5 +1,8 @@
 # RayTention — Zero-KV-Cache Attention via Geometric Signal Extraction
 
+**PATENT PENDING**
+The architecture, L2-distance signal extraction methods, and zero-cache routing mechanisms described and implemented in this repository are the subject of a pending U.S. Patent Application (App. No. 64/102,801). All rights reserved by NohWai Software.
+
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
