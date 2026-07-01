@@ -26,7 +26,7 @@
 
 ## Why RayTention?
 
-Standard transformer attention stores every key and value for every token ever seen — the **KV cache**. At 1 million tokens with a 4-layer model, that's **4.4 GB** of memory that grows with every generated token.
+Standard transformer attention stores every key and value for every token ever seen — the **KV cache**. At 1 million tokens with a 4-layer model, that's **4.4 GB** of memory that grows with every generated token. For production models (d_model=4096, 32 layers, bf16), 1M tokens requires over 500 GB.
 
 RayTention compresses the entire context window into **7 geometric signals** — a fixed 642-float vector that never grows:
 
