@@ -1,200 +1,360 @@
 # RayTention — Zero-KV-Cache Attention via Geometric Signal Extraction
 
-**PATENT PENDING**
-The architecture, L2-distance signal extraction methods, and zero-cache routing mechanisms described and implemented in this repository are the subject of a pending U.S. Patent Application (App. No. 64/102,801). All rights reserved by NohWai Software.
+---
 
-[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
+## The Problem: The KV Cache Explosion
 
-**Raytention is a new attention mechanism that solves the bloated KV cache VRAM problem. Raytention utilizes 7 signals from the context to provide the model with the attention it needs at a much lower VRAM cost.**
+Every transformer language model stores every key and value for every token it has ever seen. This is the **KV cache** — and it grows without bound.
+
+Generate 1,000 tokens? Fine. Generate 1,000,000 tokens? That KV cache now consumes gigabytes of VRAM — per request. For a production model (d_model=4096, 32 layers, bf16) at 1M context, the KV cache alone eats **~524 GB** with standard multi-head attention. Even with grouped-query attention (GQA-8, like Llama 3), it's still **~122 GB** — and it grows with every token.
+
+Your GPU can't fit one request, let alone serve hundreds of users.
+
+Every major effort to fix this — grouped-query attention (GQA), multi-head latent attention (MLA), sliding windows, sparse attention — only shrinks the constant factor. The KV cache is still $O(T)$. It still grows.
+
+| Mechanism | 1K ctx | 16K ctx | 65K ctx | 131K ctx | 262K ctx | 1M ctx |
+|---|---|---|---|---|---|---|
+| **MHA** (32 KV heads) | 0.5 GB | 8.6 GB | 34 GB | 69 GB | 137 GB | 524 GB |
+| **Flash Attention** | 0.5 GB | 8.6 GB | 34 GB | 69 GB | 137 GB | 524 GB |
+| **GQA-8** (Llama 3) | 0.1 GB | 2.1 GB | 8.6 GB | 17 GB | 34 GB | 131 GB |
+| **GQA-4** | 0.07 GB | 1.1 GB | 4.3 GB | 8.6 GB | 17 GB | 66 GB |
+| **MQA** (1 KV head) | 0.02 GB | 0.3 GB | 1.1 GB | 2.1 GB | 4.3 GB | 16 GB |
+| **MLA** (DeepSeek V2, latent=576) | 0.08 GB | 1.2 GB | 4.8 GB | 9.7 GB | 19 GB | 74 GB |
+| **Sliding Window** (Mistral, W=4K) | 0.5 GB | 0.5 GB | 0.5 GB | 0.5 GB | 0.5 GB | 0.5 GB |
+| **RayTention** | **0** | **0** | **0** | **0** | **0** | **0** |
+
+- **Flash Attention** — fused kernel, same math as MHA, same KV cache. Improves speed, not memory.
+- **Sliding Window** — $O(1)$ memory (capped at window size) but loses access to tokens outside the window. Mistral uses 4K with GQA-8; the table shows standard MHA with W=4K for comparison.
+
+
+**RayTention eliminates the KV cache entirely.** It's $O(1)$.
 
 ---
 
-## Glossary
+## The Core Insight: Attention Is Geometric
 
-| Term | What It Means |
-|------|---------------|
-| **Attention** | How a transformer decides which previous tokens are relevant to the current token. Standard attention computes a weighted average over all past tokens. |
-| **KV Cache** | The Key and Value tensors stored for every past token. Standard attention needs these to attend over the full history. At 1M tokens with a small model, this is 4.4 GB — and it grows with every token generated. |
-| **L2 Distance** | Euclidean (straight-line) distance between two vectors. RayTention uses this instead of dot-product to measure token similarity. |
-| **Softmax** | Turns a list of scores into probabilities that sum to 1.0. Used to decide how much attention each past token gets. |
-| **Signal** | A fixed-size summary computed from the attention weights and keys. RayTention extracts 7 signals (642 floats total) instead of storing the full KV cache. |
-| **AttnFFN** | A small feedforward network that processes the 7 signals into the layer's output. Replaces the weighted-sum step in standard attention. |
-| **Flash Attention** | A highly optimized CUDA kernel that makes standard attention use less memory during training. Does not eliminate the KV cache at inference. |
-| **Context / Context Window** | The sequence of previous tokens the model can "see" when predicting the next token. Longer contexts enable better understanding but cost more memory. |
-| **CE Loss** | Cross-entropy loss — measures how well the model predicts the next token. Lower is better. Random guessing on 16K vocab = ~9.7. |
+What does attention actually do? It asks: "which previous tokens are relevant to the current one?"
+
+A dot product $q \cdot k$ measures relevance by projection — how much of key $k$ lies along query $q$. It's an algebraic operation, not a geometric one. It happens to work, but it has no natural interpretation as "proximity in meaning space."
+
+**Euclidean distance does.** If two tokens mean similar things, their embeddings should be close together. A small $L_2$ distance directly means "these tokens are near each other in the space of meaning." That's what attention is trying to figure out.
+
+RayTention replaces:
+
+$$\text{score}_{\text{standard}} = \frac{q \cdot k}{\sqrt{d}} \qquad \text{with} \qquad \text{score}_{\text{raytention}} = -\|q - k\|^2_2$$
+
+Closer = higher score. Further = lower score. That's the whole scoring rule.
 
 ---
 
-## Why RayTention?
+## What RayTention Does
 
-Standard transformer attention stores every key and value for every token ever seen — the **KV cache**. At 1 million tokens with a 4-layer model, that's **4.4 GB** of memory that grows with every generated token. For production models (d_model=4096, 32 layers, bf16), 1M tokens requires over 500 GB.
+Standard attention produces one thing per token: a weighted average of value vectors, which gets fed to the next layer. The keys and values for every past token must be kept around because the next token will need to attend over them again.
 
-RayTention compresses the entire context window into **7 geometric signals** — a fixed 642-float vector that never grows:
+RayTention produces a **fixed-size structured summary** instead. For every token, it extracts 10 different "views" of the attention distribution — each one capturing a different aspect of what the model is paying attention to — plus 2 global statistics about the shape of that attention:
+
+| Channel | What it captures | Why it matters |
+|---|---|---|
+| **Centroid** | Softmax-weighted average of all context keys | The standard "what am I attending to?" — matches ordinary attention |
+| **Primacy** | Same, but heavily weighted toward early tokens | "What was established at the start?" |
+| **Sharp / Moderate / Slow Temporal** | Weighted toward recent context at three different decay rates | "What just happened?", "What's been developing?", "What's the long arc?" |
+| **Predecessor** | The immediately previous token's key | "What came right before me?" — crucial for local syntax |
+| **Top-1 / Top-2 Keys** | The two keys with highest attention weight | "What am I most focused on, specifically?" — raw embeddings, not blends |
+| **Recency** | Very recent context (fast decay) | "What's the immediate context?" |
+| **Antitop** | The key with the *least* attention (but not zero) | "What am I deliberately ignoring?" — provides contrast |
+| **Spread** | Weighted average $L_2$ distance across all attended keys | "How tight or loose is my focus?" — a single number |
+| **Entropy** | Shannon entropy of the softmax distribution | "Am I confident (peaked) or uncertain (flat)?" |
+
+All 12 channels together form a vector of **$10d + 2$ floats** — a fixed size regardless of context length. For $d=768$, that's 7,682 floats (~30 KB). At 1M tokens, standard attention's KV cache for the same model would be ~4 GB.
+
+**The key idea:** you don't need to re-read the entire history every time you generate a token. You need a rich enough summary of what the history *means*. These 12 channels are that summary.
+
+---
+
+## How It Works, Step by Step
+
+```mermaid
+flowchart TD
+    Q["hidden_states\n(queries, from prev layer)"] --> L2
+    ID["input_ids"] --> EMB["Embedding Table\n(weight-tied, BF16)"]
+    EMB --> K["keys [B, T, d]"]
+    Q --> L2["Pairwise L2 Distance\n-||q_i - k_j||²\n(causal mask: j ≤ i)"]
+    K --> L2
+    L2 --> SM["Softmax\nτ (learnable temperature)"]
+    SM --> SIG["Signal Extraction\n5 temporal-weighted views\n4 direct key copies\ncentroid + 2 scalars"]
+    SIG --> NORM["L2 Normalize\n(per-token)"]
+    NORM --> FFN["AttnFFN\n10d+2 → d"]
+    FFN --> ADD((+))
+    ADD --> OUT["to next layer\n(residual stream)"]
+
+    style L2 fill:#e65100,stroke:#bf360c,color:#fff
+    style SIG fill:#1565c0,stroke:#0d47a1,color:#fff
+    style NORM fill:#6a1b9a,stroke:#4a148c,color:#fff
+    style FFN fill:#2e7d32,stroke:#1b5e20,color:#fff
+```
+
+For each token being processed:
+
+### Step 1 — Score every past token by geometric proximity
 
 ```
-Standard:  ctx=1K → 4 MB  |  ctx=1M → 4.4 GB  (grows forever)
-RayTention: ctx=1K → 2.6 KB | ctx=1M → 2.6 KB (fixed)
+For each past token j (up to and including the current one):
+    score[j] = -||query - key[j]||²
 ```
 
-The result: you can serve **160× more concurrent requests** on the same GPU at long context lengths.
+Keys are just the embedding table entries for each token — no separate key projection. This is a dense $O(T^2)$ computation, same asymptotic cost as standard attention, but the result is used differently.
 
-## How It Works
-
-Instead of dot-product attention (`Q·K/√d`), RayTention computes **L2 distances** between the query and every context key, then extracts 7 interpretable geometric features:
+### Step 2 — Convert to attention weights (softmax)
 
 ```
-Query ──→ L2(Query, Key_i) for all i ──→ softmax weights ──→ 7 signals ──→ FFN
-Embeddings ──────────────────────────────────────────────────────┘
+w[j] = exp(score[j] / τ) / Σ_k exp(score[k] / τ)
 ```
 
-### The 7 Signals
+Temperature $\tau$ is learnable. It starts at 1.0 and can be annealed during training to sharpen attention.
 
-| # | Signal | What It Captures | Dim |
-|---|--------|-----------------|-----|
-| 1 | **Centroid** | Softmax-weighted average of all context keys — "where is the context?" | 128 |
-| 2 | **Temporal Centroid** | Weighted average with γ=0.7 decay toward recent tokens — "what's recent?" | 128 |
-| 3 | **Predecessor** | The immediately previous token's key — "what just happened?" | 128 |
-| 4 | **Top-1 Key** | Closest key by L2 distance — "what's most relevant?" | 128 |
-| 5 | **Top-2 Key** | Second-closest key — "what else matters?" | 128 |
-| 6 | **Spread** | Weighted average L2 distance — "how dispersed is attention?" | 1 |
-| 7 | **Entropy** | Shannon entropy of softmax — "how focused or confused?" | 1 |
+### Step 3 — Extract the 12 signals
 
-**Total: 642 floats** — regardless of whether the context is 10 tokens or 10 million.
+Five temporally-weighted variants apply exponential decay masks $\gamma^{\text{position}}$ to the softmax weights before computing weighted averages of keys. Different $\gamma$ values (0.99, 0.5, 0.88, 0.993, 0.3) produce different timescale emphases. The top-1, top-2, predecessor, and antitop channels copy raw key vectors directly. Spread and entropy are scalars computed from the weights.
 
-These signals feed into a small FFN (the AttnFFN) that produces the layer output, exactly like standard attention — but without ever storing or re-reading the full KV cache.
+### Step 4 — Normalize and output
 
-## Architecture
+The entire $10d+2$ signal vector is $L_2$-normalized per token. This goes to a small feedforward network (AttnFFN) that projects it back to $d$ dimensions for the residual stream — exactly like the output projection in standard attention.
 
 ```
-Input → LN → L2 distances → 7 Signals → AttnFFN → + → LN → FFN → + → Output
-         ↑                                                           |
-         └────────── Token Embeddings (shared, no KV cache) ─────────┘
+Query ──→ L2 distances ──→ softmax ──→ 12 signals ──→ AttnFFN ──→ +
+                                                                     |
+Embedding table (keys) ──────────────────────────────────────────────┘
 ```
 
-Both the standard baseline and RayTention use:
-- **4 layers**, D=128
-- **4,205,824 parameters** (matched)
-- Same FFN structure, same LayerNorm, same training loop
+**Crucially:** after computing the signals, the keys are *discarded*. There is nothing to store for future tokens. The next token will compute its own signals from scratch, looking at the embedding table and the attention weights for *its* query. The signal vector itself — not the raw keys — is what propagates forward.
 
-The only difference: attention mechanism.
+---
 
-## Benchmark Results
+## Why RayTention Exists
 
-All numbers from real measurements on an RTX 5080 (16.6 GB). Reproduce with `python3 definitive_bench.py`.
+The KV cache is not a feature of attention. It's an **architectural side effect**.
 
-### Quality (Cross-Entropy on FineWeb 16K)
+Standard attention was designed when context windows were 512 tokens and the KV cache was measured in kilobytes. Nobody designed it to scale to millions of tokens — it just happened to be a byproduct of how attention computes its output, and now everyone treats it as inevitable.
 
-| Step | Standard CE | RayTention CE |
-|------|------------|--------------|
-| 0 | 9.52 | 9.75 |
-| 1000 | 3.82 | 4.07 |
-| 1999 | 8.74 | 8.32 |
+RayTention proves it's not. You can have attention without a cache. The price is computing $O(T^2)$ distances per token (same as standard attention's scoring step), but the payoff is eliminating the $O(T)$ memory that accumulates across tokens. For inference, memory matters more than FLOPs.
 
-**Final: Standard 7.88 vs RayTention 7.85 — equal quality.** ✅
+### When does this matter?
 
-### Inference VRAM
+- **Long-form generation** (code, stories, documents): the KV cache grows with every token you emit
+- **Multi-turn conversations**: the entire history sits in VRAM for the duration
+- **Multi-tenant serving**: every concurrent user has their own KV cache; with RayTention, they'd share only model weights
+- **Edge devices**: phones and laptops can't fit million-token KV caches; they can fit $10d+2$ floats
 
-| Context | Full MHA | GQA-4 | MLA | RayTention | vs Best |
-|---------|----------|-------|-----|------------|---------|
-| 16K | 170 MB | 120 MB | 119 MB | **102 MB** | 1.2× |
-| 65K | 371 MB | 170 MB | 169 MB | **102 MB** | 1.7× |
-| 131K | 640 MB | 237 MB | 236 MB | **102 MB** | **2.3×** |
-| 262K | 1,177 MB | 371 MB | 371 MB | **102 MB** | **3.6×** |
-
-Compared against **three** industry attention mechanisms: full multi-head, GQA-4 (Llama 3 8B), and MLA (DeepSeek V2/V3). All three are O(ctx) — their KV cache grows linearly with context. RayTention is O(1). At 1M tokens, RayTention is estimated 14× smaller than the best alternative.
-
-RayTention flatlines at 102 MB — just the model weights. The 642-float signal buffer (2.6 KB) is invisible at this scale.
-
-### Speed
-
-| Context | Standard tok/s | RayTention tok/s |
-|---------|---------------|-----------------|
-| 64 | 1,726 | 691 |
-| 4K | 1,746 | 660 |
-| 131K | 1,163 | 243 |
-
-Standard is faster in PyTorch because it benefits from flash attention, cuBLAS matmul, and fused LayerNorm — decades of industry optimization. RayTention is a hand-rolled Python prototype. A native CUDA implementation would close this gap. [See Future Work →](#future-work)
+---
 
 ## Quick Start
 
 ```bash
-# Requirements: Python 3.10+, CUDA GPU, PyTorch
-pip install -r requirements.txt
-
-# Run the benchmark (auto-generates synthetic data if .tok.gz is missing)
-python3 definitive_bench.py
-
-# Or with real FineWeb data (place fineweb_16k_slice.tok.gz alongside)
-FINEWEB_TOK_PATH=/path/to/fineweb.tok python3 definitive_bench.py
+pip install torch
 ```
 
-The benchmark prints live progress during training and produces four sections:
-1. **CE Convergence** — trains both models for 2,000 steps, shows loss curves
-2. **Inference VRAM** — measures peak CUDA memory at context lengths from 1K to 1M
-3. **Per-token Speed** — measures latency at target context lengths with pre-filled caches
+```python
+import torch
+from reference_raytention import RayTention
 
-## Important: The Optimization Gap
+# Works with any model dimension
+rt = RayTention(d_model=256)
+embed = torch.nn.Embedding(vocab_size=10000, embedding_dim=256)
 
-The speed comparison is not apples-to-apples at the implementation level:
+input_ids = torch.randint(0, 10000, (2, 64))        # [batch=2, seq=64]
+hidden = embed(input_ids)
 
-**Standard Transformer benefits from:**
-- Flash Attention (fused kernel from NVIDIA/Meta/PyTorch teams)
-- cuBLAS matmul (decades of tuning)
-- Fused LayerNorm and automatic kernel fusion
+signals = rt(hidden, embed.weight, input_ids)         # [2, 64, 2562]
+# L2 norm per token is exactly 1.0
+```
 
-**RayTention (PyTorch) has:**
-- No fused kernels — L2 distance runs as separate ops
-- No flash attention equivalent (doesn't need one — O(1) output)
-- Pure Python signal assembly
+Run the built-in test:
 
-The native Rust + CUDA implementation already hits 18,816 tok/s in training mode. The PyTorch version is a research prototype for correctness comparison.
+```bash
+python3 reference_raytention.py
+# Input:  torch.Size([2, 64, 256])
+# Output: torch.Size([2, 64, 2562])
+# L2 norm per token: 1.0000 ✓
+```
+
+### Integration Recipes
+
+**Replace standard self-attention in a transformer block:**
+
+```python
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.rt = RayTention(d_model=d_model)
+        self.proj = nn.Linear(10 * d_model + 2, d_model)  # signals → residual
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model), nn.GELU(),
+            nn.Linear(4 * d_model, d_model))
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
+
+    def forward(self, x, emb_w, ids):
+        s = self.rt(self.norm1(x), emb_w, ids)
+        x = x + self.proj(s)
+        x = x + self.ffn(self.norm2(x))
+        return x
+```
+
+**Use signals to drive an MoE router:**
+
+```python
+class MoEBlock(nn.Module):
+    def __init__(self, d_model, n_experts):
+        super().__init__()
+        self.rt = RayTention(d_model=d_model)
+        # Router sees both the signal summary AND the raw hidden state
+        self.router = nn.Linear(10 * d_model + 2 + d_model, n_experts)
+
+    def forward(self, x, emb_w, ids):
+        s = self.rt(x, emb_w, ids)
+        logits = self.router(torch.cat([s, x], dim=-1))
+        # ... top-k gating, expert dispatch ...
+```
+
+**Anneal temperature during training:**
+
+```python
+rt.tau.data.fill_(1.0 / (1.0 + step / 5000.0))
+```
+
+---
+
+## Architecture
+
+```
+Input → RMSNorm → L2 distances → 12 Signals → AttnFFN → + → RMSNorm → FFN → + → Output
+        ↑                                                                         |
+        └──────────────── Token Embeddings (weight-tied, no KV projections) ──────┘
+```
+
+- **Weight-tied embeddings**: The embedding table serves as both input embeddings and attention keys. No separate $W_K$, $W_V$ projections.
+- **AttnFFN**: A small 2-layer MLP mapping $10d+2 \to d$. This replaces the output projection in standard attention.
+- **No KV cache**: Signals are computed per token, used once, and discarded. Nothing accumulates.
+
+---
+
+## Comparison to Standard Attention
+
+| | Standard Transformer | RayTention |
+|---|---|---|
+| **Scoring** | $q \cdot k$ (projection) | $-\|q - k\|^2$ (proximity) |
+| **Output** | 1 weighted-average vector | 10 structured vectors + 2 scalars |
+| **Key storage** | $W_K, W_V$ per layer | Embedding table (shared) |
+| **Inference memory** | $O(T)$ — KV cache grows | $O(1)$ — fixed signal vector |
+| **Training memory** | $O(T^2)$ attention matrix | $O(T^2)$ score matrix (chunked → $O(T \cdot C)$) |
+| **What flows forward** | Attended values + residual | Signal summary + residual |
+| **Interpretability** | Attention weights only | Centroid, spread, entropy, top-k keys |
+| **Multi-tenant cost** | Per-user KV cache × $T$ | Per-user signal vector (fixed) |
+
+---
+
+## Training Memory: The Honest Picture
+
+During training, both standard attention and RayTention materialize a $T \times T$ matrix:
+
+- **Standard attention**: the attention weight matrix ($QK^\top$)
+- **RayTention**: the pairwise distance matrix ($\|q_i - k_j\|^2$)
+
+Without batching or chunking, this is $O(T^2)$ VRAM in both cases. At $T{=}2048$ with $d{=}768$ and batch 8, that's ~134 MB for the score matrix alone — manageable. At $T{=}32768$, it's ~34 GB — not.
+
+RayTention's **chunked streaming** mode (see [paper](RayTention_Paper.md#2-chunked-streaming)) solves this:
+
+```
+for each chunk of 2048 keys:
+    compute scores[all_queries, this_chunk]   ← only 2048 columns at a time
+    accum_chunk(accumulator, scores)           ← merge into running state
+signals = accum_finalize(accumulator)          ← extract 12 channels
+```
+
+This reduces training memory from $O(T^2)$ to $O(T \cdot C)$ where $C$ is the chunk size (default 2048). Same trick as FlashAttention's tiling — but applied to signal accumulation instead of softmax rescaling.
+
+**The key distinction:**
+
+| | Standard Attention | RayTention |
+|---|---|---|
+| **Training forward pass** | $O(T^2)$ attention matrix | $O(T \cdot C)$ with chunking |
+| **Training backward pass** | $O(T^2)$ gradients | $O(T \cdot C)$ with chunking |
+| **Inference per new token** | Must re-read $O(T)$ KV cache | Computes signals from scratch ($O(T)$) but stores nothing |
+| **Inference total memory** | $O(T)$ KV cache accumulates | $O(1)$ — signals replace the cache |
+
+RayTention doesn't eliminate the $O(T^2)$ compute — nothing can, because every token must compare against every past token. What it eliminates is the $O(T)$ *accumulation* of state across tokens during inference.
+
+---
+
+## Benchmarks
+
+Measured on RTX 5080 (16.6 GB), CUDA 13.3, Rust + cuBLAS. See [RayTention_Paper.md](RayTention_Paper.md) for kernel-level details.
+
+### Model Config (current CUDA implementation)
+
+| Parameter | Value |
+|---|---|
+| Layers | 4 |
+| d_model | 768 |
+| FFN hidden | 3,072 |
+| Vocab | 49,152 |
+| Params | ~268.5M |
+| Embedding table | 75 MB (BF16, L2-cache resident) |
+| Signal dimension | 7,682 floats (~30 KB) per token |
+| Score matrix (T=2048, B=8) | ~134 MB fp32 (1 chunk at C=2048; $O(T \cdot C)$ with chunking for longer sequences) |
+
+> Training throughput benchmarks are in progress. The chunked streaming kernels are implemented and functional; stable throughput numbers will be published once the current training run completes.
+
+---
 
 ## Where RayTention Wins
 
-| Scenario | Advantage |
-|----------|-----------|
-| **Long-context inference** | No KV cache — 42× less VRAM at 1M tokens |
-| **Multi-tenant serving** | 160× more concurrent users on one GPU |
-| **Edge deployment** | Runs on hardware where KV cache is prohibitive |
-| **Retrieval / RAG** | Compute signals once, reuse across queries (O(1) per query) |
-| **Interpretability** | Centroid, spread, entropy are human-readable features |
-| **Simplicity** | 5 kernel types vs dozens for standard transformers |
+| Scenario | Why |
+|---|---|
+| **Long-context inference** | Memory is $O(1)$, not $O(T)$. Generate indefinitely. |
+| **Multi-tenant serving** | Every user shares model weights; only a signal vector per request |
+| **Edge deployment** | Fits where KV cache would exceed device RAM |
+| **Retrieval / RAG** | Compute signals once per document, reuse for all queries |
+| **Interpretability** | Spread and entropy tell you how the model is thinking |
+| **Simplicity** | 2–3 kernel types vs dozens for fused standard attention |
 
 ## Where Standard Wins
 
-| Scenario | Reason |
-|----------|--------|
-| **Short contexts (<1K)** | KV cache is negligible; optimized matmul is faster |
-| **Training throughput** | Flash attention + fused kernels are highly tuned |
-| **Ecosystem maturity** | PyTorch/HF integration, tooling, proven at scale |
+| Scenario | Why |
+|---|---|
+| **Short contexts (< 1K)** | KV cache is tiny; FlashAttention is extremely optimized |
+| **Training throughput** | cuBLAS + FlashAttention have decades of person-years invested |
+| **Ecosystem** | Every framework, every serving stack, every quantization tool supports it |
 
-## Future Work
-
-- **RT Core acceleration** — RayTention's L2 distance scoring is fundamentally a ray tracing operation. NVIDIA RT cores (hardware-accelerated ray-triangle intersection) could compute L2 distances for thousands of keys in parallel with zero CUDA core utilization, making the scoring step effectively free.
-- **Rust/CUDA inference binary** — fuse L2+topk+signals into one kernel; eliminate Python overhead
-- **Incremental signals** — update centroid, spread, top-k in O(1) per new token instead of O(ctx)
-- **Signal reuse across layers** — compute signals once, feed to all deeper layers
-- **Longer training** — 100K+ steps on full FineWeb, downstream perplexity evaluation
-- **Scaling laws** — how does quality hold at D=512, 768, 4096?
+---
 
 ## Files
 
 | File | Purpose |
-|------|---------|
-| `definitive_bench.py` | Self-contained benchmark (PyTorch) |
-| `COMPARISON.md` | Full comparison report with all measurements |
-| `fineweb_16k_slice.tok.gz` | Compressed FineWeb 16K tokenized sample (optional) |
-| `requirements.txt` | Python dependencies |
+|---|---|
+| `reference_raytention.py` | Pure PyTorch reference — runs on CPU, matches CUDA kernels exactly |
+| `RayTention_Paper.md` | Full technical paper: CUDA kernels, chunked streaming, OptiX backend, backward pass |
+| `LICENSE` | AGPL-3.0 |
+| `README.md` | This file |
+
+---
+
+## Future Work
+
+- **RT Core scoring** — $L_2$ distance maps directly to ray tracing hardware. NVIDIA RT cores could compute pairwise distances for thousands of keys in parallel with zero CUDA core utilization.
+- **Incremental signals** — Update centroid, spread, and top-k in $O(1)$ per new token instead of recomputing from scratch.
+- **Signal reuse across layers** — Compute signals once at the bottom, feed to all higher layers.
+- **Scaling laws** — Quality at $d = 512, 768, 4096, 8192$; how many signals are needed as dimension grows?
+- **Native inference binary** — Fuse scoring + signal extraction into a single CUDA kernel with no Python overhead.
+
+---
 
 ## Citation
-
-If you use RayTention in your research:
 
 ```bibtex
 @software{raytention2026,
   title     = {RayTention: Zero-KV-Cache Attention via Geometric Signal Extraction},
+  author    = {NohWai Software},
   year      = {2026},
   url       = {https://github.com/NohWai-Software/RayTention}
 }
@@ -203,3 +363,7 @@ If you use RayTention in your research:
 ## License
 
 AGPL-3.0 — see [LICENSE](LICENSE)
+
+---
+
+*Patent Pending — U.S. Patent Application No. 64/102,801. All rights reserved by NohWai Software.*
