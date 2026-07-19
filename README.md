@@ -91,6 +91,8 @@ flowchart TD
     style SIG fill:#1565c0,stroke:#0d47a1,color:#fff
     style NORM fill:#6a1b9a,stroke:#4a148c,color:#fff
     style FFN fill:#2e7d32,stroke:#1b5e20,color:#fff
+    classDef plain fill:#1a1a2e,stroke:#444,color:#ddd
+    class Q,ID,EMB,K,SM,ADD,OUT plain
 ```
 
 For each token being processed:
@@ -367,3 +369,4 @@ AGPL-3.0 — see [LICENSE](LICENSE)
 ---
 
 *Patent Pending — U.S. Patent Application No. 64/102,801. All rights reserved by NohWai Software.*
+
